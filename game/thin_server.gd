@@ -7,6 +7,9 @@ const Feed := preload("res://game/thin_client_feed.gd")
 const MapOutline := preload("res://game/thin_client_map.gd")
 const FULL_TIER_PATH := "res://game/open_protocol/full_tier.gd"
 const VERSION := 1
+## Older clients may wait for a snapshot before sending their first input.
+const BOOTSTRAP_MS := 15000
+const BOOTSTRAP_RATE := 2
 ## Established Open Protocol connections: Thin sessions plus Full peers.
 const MAX_CONNECTIONS := 12
 ## Connections that have not sent a valid hello yet. Kept apart from
@@ -36,6 +39,7 @@ class Session:
 	var radius := 0.0
 	var max_enemies := -1
 	var next_snap := 0
+	var bootstrap_until := 0
 	var tick := 0
 	var last_lobby := {}
 	var feed: Feed
@@ -104,14 +108,20 @@ func _process(_delta: float) -> void:
 			continue
 		for packet in packets:
 			_receive(session, packet)
-			if session.wire.closing or session not in _sessions:
+			if session.wire.closing or session.wire.closed:
 				break
-		if session not in _sessions or session.wire.closing or not session.input:
+		if session not in _sessions or session.wire.closing or session.wire.closed or not session.input:
 			continue
 		if session.state == "loading":
 			_check_player(session)
-		if session.state == "run" and now >= session.next_snap:
+		if session.state == "run" and now >= session.next_snap and session.wire.can_send_snapshot():
 			_snapshot(session, now)
+
+
+func _exit_tree() -> void:
+	for session in _sessions:
+		session.wire.close("server shutdown", "Server shutting down", 1001)
+		session.wire.dispose()
 
 
 func _accept(listener: TCPServer, websocket: bool) -> void:
@@ -171,15 +181,19 @@ func _receive(session: Session, packet: Dictionary) -> void:
 			session.wire.send_message({"t": "pong", "ms": message.get("ms")})
 		"leave":
 			_status(session, "disconnected", "Left session")
+			session.wire.close("left session")
 			_release_player(session)
-			session.wire.close()
 		"lobby":
 			if session.state in ["lobby", "results"]:
 				_lobby_action(session.input.id, message)
 		"in":
 			if session.state == "run":
 				if session.wire.encoding != "bin" or ThinClientInput.integer(message.get("seq"), 0, Binary.NO_ACK - 1, -1) >= 0:
-					session.input.enqueue(message)
+					if session.input.enqueue(message):
+						_client_loaded(session)
+		"loaded":
+			if session.state in ["loading", "run"]:
+				_client_loaded(session)
 		"choice":
 			if session.state == "run":
 				_choose(session.input.id, message)
@@ -213,9 +227,10 @@ func _hello(session: Session, message: Dictionary) -> void:
 	match message.get("tier", "thin"):
 		"full":
 			if ResourceLoader.exists(FULL_TIER_PATH):
-				_sessions.erase(session)
+				session.wire.label = "full"
 				var tier = load(FULL_TIER_PATH)
-				tier.accept(session.wire, message)
+				if tier.accept(session.wire, message):
+					_sessions.erase(session)
 			else:
 				_fail(session, "full tier unavailable")
 			return
@@ -238,6 +253,7 @@ func _hello(session: Session, message: Dictionary) -> void:
 	session.radius = clampf(radius, 1, 500) if ThinClientInput.number(radius) and radius > 0 else 0.0
 	session.max_enemies = ThinClientInput.integer(message.get("max_enemies"), 0, 256, -1)
 	session.input = ThinClientInput.new(id)
+	session.wire.label = "thin peer %d" % id
 	_by_id[id] = session
 	Net.add_thin_player(id, "THIN PLAYER" if callsign.is_empty() else callsign)
 	session.wire.send_message({"t": "welcome", "v": VERSION, "game_protocol": Net.PROTOCOL, "you": id,
@@ -534,15 +550,14 @@ func _release_player(session: Session) -> void:
 
 
 func _dispose(session: Session) -> void:
-	_release_player(session)
 	session.wire.dispose()
+	_release_player(session)
 	_sessions.erase(session)
 
 
 func _fail(session: Session, message: String) -> void:
-	session.wire.send_message({"t": "error", "msg": message})
+	session.wire.close("protocol error", message, 1008)
 	_release_player(session)
-	session.wire.close()
 
 
 func _status(session: Session, state: String, msg := "") -> void:
@@ -600,6 +615,7 @@ func _load_run(session: Session) -> void:
 	session.feed.radius = session.radius
 	session.feed.max_enemies = session.max_enemies
 	session.next_snap = 0
+	session.bootstrap_until = Time.get_ticks_msec() + BOOTSTRAP_MS
 	_status(session, "loading")
 	session.wire.send_message({"t": "load", "map": Net.run_map_id})
 
@@ -619,20 +635,24 @@ func _check_player(session: Session) -> void:
 		_send_tape(session)
 
 
+func _client_loaded(session: Session) -> void:
+	if session.bootstrap_until:
+		session.bootstrap_until = 0
+		session.next_snap = 0
+
+
 func _snapshot(session: Session, now: int) -> void:
 	var player := GameManager.player_for_peer(session.input.id) as Player
 	var loot := RunLoot.find(get_tree())
 	if not player or not loot:
 		return
-	var interval := 1000.0 / session.rate
+	var rate := BOOTSTRAP_RATE if now < session.bootstrap_until else session.rate
+	var interval := 1000.0 / rate
 	session.next_snap = now + roundi(interval) if session.next_snap == 0 else (
 		maxi(now + 1, session.next_snap + roundi(interval)))
 	session.tick += 1
 	var frame := session.feed.snapshot(player, loot, session.tick, session.input.ack, now)
-	if session.wire.encoding == "bin":
-		session.wire.send_binary(Binary.snapshot(frame))
-	else:
-		session.wire.send_message(frame)
+	session.wire.send_snapshot(Binary.snapshot(frame) if session.wire.encoding == "bin" else frame)
 	_flush_events(session)
 
 

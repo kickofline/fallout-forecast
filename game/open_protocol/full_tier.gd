@@ -8,11 +8,10 @@ extends RefCounted
 const FullPeer := preload("res://game/open_protocol/full_peer.gd")
 
 
-static func accept(conn: RefCounted, hello: Dictionary) -> void:
+static func accept(conn: RefCounted, hello: Dictionary) -> bool:
 	var peer := FullPeer.get_active()
 	if peer == null:
-		conn.send_message({"t": "error", "msg": "Full tier server is not active"})
-		conn.close("unavailable")
-		conn.dispose()
-		return
+		conn.close("unavailable", "Full tier server is not active", 1011)
+		return false
 	peer.add_full_peer(conn, hello)
+	return true

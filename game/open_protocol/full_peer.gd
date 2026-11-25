@@ -22,6 +22,7 @@ class FullClient:
 	var conn: RefCounted  # game/open_protocol_wire.gd
 	var encoding: String
 	var join_deadline: int = 0
+	var rejection := ""
 	## Server SceneCacheInterface cache_id -> relative node path (for this peer).
 	var server_cache: Dictionary = {}
 
@@ -70,19 +71,18 @@ func _on_ws_peer_disconnected(id: int) -> void:
 ## Admit an Open Protocol connection (after hello validation) as a real peer.
 func add_full_peer(conn: RefCounted, _hello: Dictionary) -> int:
 	if _closed or _refuse:
-		conn.send_message({"t": "error", "msg": "Server is not accepting connections"})
-		conn.close("refused")
+		conn.close("refused", "Server is not accepting connections", 1008)
 		_enqueue_drain(conn)
 		return 0
 	if _full_peers.size() >= MAX_FULL_PEERS:
-		conn.send_message({"t": "error", "msg": "Too many Open Protocol connections"})
-		conn.close("full")
+		conn.close("full", "Too many Open Protocol connections", 1008)
 		_enqueue_drain(conn)
 		return 0
 	var peer_id := _allocate_peer_id()
 	var client := FullClient.new()
 	client.peer_id = peer_id
 	client.conn = conn
+	conn.label = "full peer %d" % peer_id
 	client.encoding = str(conn.encoding)
 	client.join_deadline = Time.get_ticks_msec() + JOIN_DEADLINE_MS
 	_full_peers[peer_id] = client
@@ -168,11 +168,13 @@ func _poll() -> void:
 			if Net.roster.has(peer_id):
 				client.join_deadline = 0
 			elif now >= client.join_deadline:
-				_disconnect_full_peer(peer_id, "join timeout")
+				_disconnect_full_peer(peer_id, "join timeout", "Full tier join timed out", 1008)
 				continue
 		var packets: Array = client.conn.poll()
 		if client.conn.closed:
-			_remove_full_peer(peer_id, false)
+			_remove_full_peer(peer_id)
+			continue
+		if client.conn.closing:
 			continue
 		for pkt: Dictionary in packets:
 			_handle_client_packet(client, pkt, tree)
@@ -361,6 +363,8 @@ func _send_to_full(client: FullClient, p_buffer: PackedByteArray) -> Error:
 		Codec.CMD_CONFIRM_PATH:
 			pass
 		Codec.CMD_REMOTE_CALL:
+			if dec["node"] == "Net" and dec["method"] == "_reject" and not dec["args"].is_empty():
+				client.rejection = str(dec["args"][0])
 			if client.encoding == "bin":
 				var frame := Codec.encode_full_bin_rpc(
 					str(dec["node"]), str(dec["method"]), dec["args"], _transfer_channel, int(_transfer_mode))
@@ -442,36 +446,36 @@ func _is_server_relay_supported() -> bool:
 
 func _disconnect_peer(p_peer: int, p_force: bool) -> void:
 	if _full_peers.has(p_peer):
+		var client: FullClient = _full_peers[p_peer]
+		var reason := "disconnected" if client.rejection.is_empty() else "game handshake rejected"
+		var message := "Server disconnected this peer" if client.rejection.is_empty() else client.rejection
 		if p_force:
-			_remove_full_peer(p_peer, true)
+			client.conn.close(reason, message)
+			_remove_full_peer(p_peer)
 		else:
-			_disconnect_full_peer(p_peer, "disconnected")
+			_disconnect_full_peer(p_peer, reason, message)
 	elif _ws != null:
 		_ws.disconnect_peer(p_peer, p_force)
 
 
-func _disconnect_full_peer(peer_id: int, reason: String) -> void:
+func _disconnect_full_peer(peer_id: int, reason: String, message := "", code := 1000) -> void:
 	var client: FullClient = _full_peers.get(peer_id)
 	if client == null:
 		return
 	_full_peers.erase(peer_id)
 	_purge_inbox(peer_id)
-	client.conn.close(reason)
+	client.conn.close(reason, message, code)
 	_enqueue_drain(client.conn)
 	peer_disconnected.emit(peer_id)
 
 
-func _remove_full_peer(peer_id: int, dispose_now: bool) -> void:
+func _remove_full_peer(peer_id: int) -> void:
 	var client: FullClient = _full_peers.get(peer_id)
 	if client == null:
 		return
 	_full_peers.erase(peer_id)
 	_purge_inbox(peer_id)
-	if dispose_now or client.conn.closed:
-		client.conn.dispose()
-	else:
-		client.conn.close()
-		_enqueue_drain(client.conn)
+	client.conn.dispose()
 	peer_disconnected.emit(peer_id)
 
 
@@ -491,6 +495,7 @@ func _close() -> void:
 		_active = null
 	for peer_id: int in _full_peers.keys():
 		var client: FullClient = _full_peers[peer_id]
+		client.conn.close("server shutdown", "Server shutting down", 1001)
 		client.conn.dispose()
 	_full_peers.clear()
 	for conn in _draining_conns:

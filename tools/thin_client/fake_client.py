@@ -16,7 +16,7 @@ import statistics
 import time
 
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosedOK
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 FIRE = 1
 AIM = 2
@@ -170,6 +170,7 @@ class Client:
         self.buttons = 0
         self.latest = None
         self.saw_hurt = False
+        self.next_read = 0.0
         self.sizes = {"without_enemies": [], "with_enemies": []}
 
     async def send(self, kind, **fields):
@@ -178,6 +179,10 @@ class Client:
     async def wait(self, kind, predicate=lambda _: True, timeout=15):
         async with asyncio.timeout(timeout):
             while True:
+                if self.args.read_rate:
+                    now = time.monotonic()
+                    await asyncio.sleep(max(0, self.next_read - now))
+                    self.next_read = time.monotonic() + 1 / self.args.read_rate
                 payload = await self.socket.recv()
                 if isinstance(payload, bytes):
                     assert self.encoding == "bin", "Unexpected binary frame"
@@ -243,6 +248,12 @@ class Client:
         await self.wait("lobby", lambda m: any(p["id"] == you and p["ready"] for p in m["players"]))
         await self.send("lobby", a="start")
         load = await self.wait("load", timeout=30)
+        if self.args.stall_after_load:
+            print(f"Stalling all client I/O for {self.args.stall_after_load:g} s after load", flush=True)
+            # A blocked game thread can't poll the socket or answer WebSocket pings.
+            time.sleep(self.args.stall_after_load)
+        if self.args.send_loaded:
+            await self.send("loaded")
         await self.wait("status", lambda m: m["state"] == "run", timeout=30)
         print(f"PASS run ready on {load['map']}", flush=True)
         await self.send("map_req")
@@ -299,7 +310,7 @@ class Client:
 
     def print_sizes(self):
         duration = (self.last_snap - self.first_snap) / 1000
-        if duration > 3:
+        if duration > 3 and not self.args.read_rate:
             rate = (self.snapshots - 1) / duration
             assert abs(rate - self.args.rate) <= max(0.75, self.args.rate * 0.15), rate
             print(f"PASS snapshot cadence {rate:.2f} Hz")
@@ -326,7 +337,7 @@ async def main(args):
         if args.expect_error:
             error = await car.wait("error", timeout=5)
             assert args.expect_error in error["msg"], error
-            await assert_closed(socket)
+            await assert_closed(socket, rejected=True)
             print(f"PASS rejected handshake ({error['msg']})", flush=True)
             return
         welcome = await car.wait("welcome", timeout=15)
@@ -348,11 +359,15 @@ async def main(args):
         print("PASS clean disconnect", flush=True)
 
 
-async def assert_closed(socket):
+async def assert_closed(socket, rejected=False):
     try:
         await asyncio.wait_for(socket.recv(), timeout=5)
     except (ConnectionClosedOK, asyncio.IncompleteReadError):
         return
+    except ConnectionClosedError as error:
+        if rejected and error.rcvd is not None:
+            return
+        raise
     raise AssertionError("Expected the server to close")
 
 
@@ -375,7 +390,14 @@ if __name__ == "__main__":
     parser.add_argument("--expect-error", help="assert the handshake error contains this text")
     parser.add_argument("--require-results", action="store_true")
     parser.add_argument("--observe-seconds", type=float, default=5)
+    parser.add_argument("--stall-after-load", type=float, default=0,
+                        help="Block all client I/O for this many seconds immediately after load")
+    parser.add_argument("--read-rate", type=float, default=0,
+                        help="Limit application reads to this many messages per second (0 = unlimited)")
+    parser.add_argument("--send-loaded", action="store_true", help="Send the optional loaded message")
     args = parser.parse_args()
+    if any(not math.isfinite(value) or value < 0 for value in (args.stall_after_load, args.read_rate)):
+        parser.error("--stall-after-load and --read-rate must be finite and nonnegative")
     try:
         asyncio.run(main(args))
     except Exception as error:
