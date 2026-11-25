@@ -20,7 +20,16 @@ Thin clients share the same lobby, run, and four-player limit as native clients.
 Connect to Open Protocol over WebSocket on port 7780 or raw TCP on port 7781.
 Set either port to 0 to disable that listener. Set `FALLOUT_THIN_JOIN_CODE`
 to require a shared join code in the Open Protocol hello. `--thin-join-code=VALUE`
-overrides the environment variable.
+overrides the environment variable. Use a long random code (12+ characters). The
+code applies only to the Open Protocol ports, not to the native port 7777.
+
+Wrong join codes are logged and rate-limited per client address. If every
+WebSocket client reaches the server through a reverse proxy, list the proxy's
+address in `FALLOUT_TRUSTED_PROXIES` (comma-separated, or `--trusted-proxies=`)
+so per-address limits don't treat all players as one client; a server-wide
+limit still applies. Rate-limit connections at the proxy or firewall too:
+Godot's listener keeps a short accept backlog, so a fast reconnect flood is best
+dropped before it reaches the server.
 
 Use a TLS-terminating reverse proxy for public WebSocket connections. Raw TCP is
 plaintext, including the join code. Publish it only on a network where plaintext is

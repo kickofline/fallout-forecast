@@ -7,7 +7,25 @@ const Feed := preload("res://game/thin_client_feed.gd")
 const MapOutline := preload("res://game/thin_client_map.gd")
 const FULL_TIER_PATH := "res://game/open_protocol/full_tier.gd"
 const VERSION := 1
+## Established Open Protocol connections: Thin sessions plus Full peers.
 const MAX_CONNECTIONS := 12
+## Connections that have not sent a valid hello yet. Kept apart from
+## MAX_CONNECTIONS so idle sockets can't lock out clients that do say hello.
+const MAX_PENDING := 16
+const MAX_PENDING_PER_ADDRESS := 3
+## Refused connections are dropped without a handshake, so many can be cleared
+## per frame; that keeps a reconnect flood from starving the OS accept backlog.
+const MAX_TAKES_PER_FRAME := 128
+const MAX_ADMITS_PER_FRAME := 4
+## Wrong join codes from one address before it is refused for a cooldown.
+## The cooldown doubles on each repeat, up to COOLDOWN_MAX_MS.
+const FAIL_LIMIT := 5
+const FAIL_WINDOW_MS := 60000
+const COOLDOWN_MS := 60000
+const COOLDOWN_MAX_MS := 3600000
+## Wrong join codes per minute across every address (covers clients that all
+## arrive from one trusted proxy address). Past this, codes are not checked.
+const GLOBAL_FAILS_PER_MINUTE := 30
 
 
 class Session:
@@ -27,6 +45,11 @@ class Session:
 var _websocket := TCPServer.new()
 var _raw := TCPServer.new()
 var _join_code := ""
+## Addresses exempt from per-address limits, e.g. a TLS proxy in front of the
+## WebSocket port that every client appears to come from.
+var _trusted_proxies := PackedStringArray()
+var _failures := {}  # address -> {"count", "first", "until", "strikes"}
+var _global_fails: Array[int] = []
 var _sessions: Array[Session] = []
 var _by_id: Dictionary = {}
 var _next_id := 2
@@ -35,9 +58,11 @@ var _map_cache := {}
 var _downs := {}
 
 
-func listen(ws_port: int, tcp_port: int, join_code: String) -> Error:
+func listen(ws_port: int, tcp_port: int, join_code: String,
+		trusted_proxies := PackedStringArray()) -> Error:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_join_code = join_code
+	_trusted_proxies = trusted_proxies
 	if ws_port > 0:
 		var err := _websocket.listen(ws_port)
 		if err != OK:
@@ -90,16 +115,32 @@ func _process(_delta: float) -> void:
 
 
 func _accept(listener: TCPServer, websocket: bool) -> void:
-	for _i in 4:
-		if not listener.is_connection_available():
+	var admitted := 0
+	for _i in MAX_TAKES_PER_FRAME:
+		if admitted >= MAX_ADMITS_PER_FRAME or not listener.is_connection_available():
 			return
 		var stream := listener.take_connection()
-		if _sessions.size() + _full_peer_count() >= MAX_CONNECTIONS:
+		var address := stream.get_connected_host()
+		if _pending_count() >= MAX_PENDING or _blocked(address) or (
+				_per_address(address) and _pending_count(address) >= MAX_PENDING_PER_ADDRESS):
 			stream.disconnect_from_host()
 			continue
+		admitted += 1
 		var session := Session.new()
 		session.wire = Wire.new(stream, websocket)
 		_sessions.append(session)
+
+
+func _pending_count(address := "") -> int:
+	var count := 0
+	for session: Session in _sessions:
+		if session.state.is_empty() and (address.is_empty() or session.wire.peer_address == address):
+			count += 1
+	return count
+
+
+func _established_count() -> int:
+	return _sessions.size() - _pending_count() + _full_peer_count()
 
 
 func _full_peer_count() -> int:
@@ -150,12 +191,22 @@ func _hello(session: Session, message: Dictionary) -> void:
 	if message.t != "hello" or ThinClientInput.integer(message.get("v"), 1, 1, 0) != VERSION:
 		_fail(session, "Expected hello with Open Protocol v%d" % VERSION)
 		return
-	if not _join_code.is_empty() and message.get("code") != _join_code:
-		_fail(session, "Invalid join code")
-		return
+	if not _join_code.is_empty():
+		var address := session.wire.peer_address
+		if _blocked(address) or _recent_global_fails() >= GLOBAL_FAILS_PER_MINUTE:
+			_fail(session, "Too many join attempts, try again later")
+			return
+		if not _code_matches(message.get("code")):
+			_record_failure(address)
+			_fail(session, "Invalid join code")
+			return
+		_failures.erase(address)
 	var enc: Variant = message.get("enc", "json")
 	if enc not in ["json", "bin"]:
 		_fail(session, "Unsupported encoding")
+		return
+	if _established_count() >= MAX_CONNECTIONS:
+		_fail(session, "Too many Open Protocol connections")
 		return
 	session.wire.encoding = enc
 	session.wire.deadline = 0
@@ -177,7 +228,7 @@ func _hello(session: Session, message: Dictionary) -> void:
 		_fail(session, "SERVER FULL")
 		return
 	var name_value: Variant = message.get("name")
-	var callsign := Net._clean_chat(name_value).left(18) if name_value is String else ""
+	var callsign := Net.clean_name(name_value)
 	while Net.roster.has(_next_id) or _next_id in multiplayer.get_peers():
 		_next_id += 1
 	var id := _next_id
@@ -196,6 +247,63 @@ func _hello(session: Session, message: Dictionary) -> void:
 	_send_lobby(session)
 	if Net.run_active:
 		_load_run(session)
+
+
+# ------------------------------------------------------------------ join code limits
+## Constant-time comparison of a hello code with the server's join code.
+func _code_matches(value: Variant) -> bool:
+	if not value is String:
+		return false
+	var given := (value as String).sha256_buffer()
+	var expected := _join_code.sha256_buffer()
+	var diff := 0
+	for i in expected.size():
+		diff |= given[i] ^ expected[i]
+	return diff == 0
+
+
+func _per_address(address: String) -> bool:
+	return not address.is_empty() and address not in _trusted_proxies
+
+
+func _blocked(address: String) -> bool:
+	if not _per_address(address):
+		return false
+	var row: Dictionary = _failures.get(address, {})
+	return not row.is_empty() and Time.get_ticks_msec() < int(row.until)
+
+
+func _recent_global_fails() -> int:
+	var cutoff := Time.get_ticks_msec() - 60000
+	while not _global_fails.is_empty() and _global_fails[0] < cutoff:
+		_global_fails.pop_front()
+	return _global_fails.size()
+
+
+func _record_failure(address: String) -> void:
+	var now := Time.get_ticks_msec()
+	_global_fails.append(now)
+	print("[open-protocol] invalid join code from %s" % address)
+	if not _per_address(address):
+		return
+	if _failures.size() > 4096:
+		for key: String in _failures.keys():
+			var old: Dictionary = _failures[key]
+			if now >= int(old.until) and now - int(old.first) > FAIL_WINDOW_MS:
+				_failures.erase(key)
+	var row: Dictionary = _failures.get(address, {"count": 0, "first": now, "until": 0, "strikes": 0})
+	if now - int(row.first) > FAIL_WINDOW_MS:
+		row.count = 0
+		row.first = now
+	row.count = int(row.count) + 1
+	if int(row.count) >= FAIL_LIMIT:
+		row.strikes = int(row.strikes) + 1
+		var cooldown := mini(COOLDOWN_MS << mini(int(row.strikes) - 1, 10), COOLDOWN_MAX_MS)
+		row.until = now + cooldown
+		row.count = 0
+		row.first = now
+		print("[open-protocol] %s refused for %d s after repeated invalid join codes" % [address, cooldown / 1000])
+	_failures[address] = row
 
 
 func _release_player(session: Session) -> void:

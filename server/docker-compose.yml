@@ -12,6 +12,7 @@ services:
     cpus: 1.5
     environment:
       FALLOUT_THIN_JOIN_CODE: ${FALLOUT_THIN_JOIN_CODE:-}
+      FALLOUT_TRUSTED_PROXIES: ${FALLOUT_TRUSTED_PROXIES:-}
     ports:
       - "7777:7777"
       - "7780:7780"

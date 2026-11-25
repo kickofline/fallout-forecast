@@ -241,10 +241,10 @@ func _ingest_json_rpc(client: FullClient, msg: Dictionary, tree: SceneTree) -> v
 	for i in raw_args.size():
 		var hint: int = hints[i] if i < hints.size() else TYPE_NIL
 		args.append(VariantJson.from_json(raw_args[i], hint))
-	var ch: int = int(msg.get("ch", -1))
+	var ch := ThinClientInput.integer(msg.get("ch"), 0, 255, -1)
 	var mode: int = -1
-	if msg.has("rel"):
-		mode = MultiplayerPeer.TRANSFER_MODE_RELIABLE if bool(msg["rel"]) else MultiplayerPeer.TRANSFER_MODE_UNRELIABLE_ORDERED
+	if msg.get("rel") is bool:
+		mode = MultiplayerPeer.TRANSFER_MODE_RELIABLE if msg["rel"] else MultiplayerPeer.TRANSFER_MODE_UNRELIABLE_ORDERED
 	_enqueue_rpc_from_client(client, norm_path, method_val, args, ch, mode, tree)
 
 
@@ -256,8 +256,9 @@ func _ingest_json_raw(client: FullClient, msg: Dictionary) -> void:
 	var raw := Marshalls.base64_to_raw(b64)
 	if raw.is_empty():
 		return
-	var ch := int(msg.get("ch", 0))
-	var mode := MultiplayerPeer.TRANSFER_MODE_RELIABLE if bool(msg.get("rel", true)) else MultiplayerPeer.TRANSFER_MODE_UNRELIABLE
+	var ch := ThinClientInput.integer(msg.get("ch"), 0, 255, 0)
+	var reliable: Variant = msg.get("rel", true)
+	var mode := MultiplayerPeer.TRANSFER_MODE_UNRELIABLE if reliable is bool and not reliable else MultiplayerPeer.TRANSFER_MODE_RELIABLE
 	_full_inbox.append({
 		"peer": client.peer_id,
 		"channel": ch,

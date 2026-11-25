@@ -22,6 +22,12 @@ var closing := false
 var _in := PackedByteArray()
 var _out := PackedByteArray()
 
+## Godot's JSON.stringify leaves U+0000-U+001F raw (except \b \t \n \f \r) and
+## writes U+000B as "\v", neither of which is valid JSON. _UNSAFE spots either
+## quickly; _TOKENS walks escape pairs so a literal backslash is never misread.
+static var _UNSAFE: RegEx
+static var _TOKENS: RegEx
+
 
 func _init(stream: StreamPeerTCP, websocket: bool) -> void:
 	stream.set_no_delay(true)
@@ -88,7 +94,29 @@ func poll(limit := MAX_BATCH) -> Array[Dictionary]:
 
 
 func send_message(message: Dictionary) -> void:
-	_send(JSON.stringify(message, "", false).to_utf8_buffer(), true)
+	_send(strict_json(JSON.stringify(message, "", false)).to_utf8_buffer(), true)
+
+
+## Rewrite JSON.stringify output into RFC 8259 JSON. Clean text passes through.
+static func strict_json(text: String) -> String:
+	if _UNSAFE == null:
+		_UNSAFE = RegEx.create_from_string("[\\x00-\\x1f]|\\\\v")
+		_TOKENS = RegEx.create_from_string("\\\\.|[\\x00-\\x1f]")
+	if _UNSAFE.search(text) == null:
+		return text
+	var out := ""
+	var last := 0
+	for found in _TOKENS.search_all(text):
+		var token := found.get_string()
+		var replacement := token
+		if token == "\\v":
+			replacement = "\\u000b"
+		elif token.length() == 1:
+			replacement = "\\u%04x" % token.unicode_at(0)
+		if replacement != token:
+			out += text.substr(last, found.get_start() - last) + replacement
+			last = found.get_end()
+	return out + text.substr(last)
 
 
 func send_binary(payload: PackedByteArray) -> void:

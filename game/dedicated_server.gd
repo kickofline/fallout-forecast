@@ -20,6 +20,7 @@ var _port := 7777
 var _thin_port := 7780
 var _thin_tcp_port := 7781
 var _thin_join_code := ""
+var _trusted_proxies := PackedStringArray()
 var _default_map := Maps.DEFAULT_ID
 var _heartbeat_path := ""
 var _heartbeat_left := 0.0
@@ -31,6 +32,7 @@ var _run_serial := 0
 func _ready() -> void:
 	_port = Net.PORT
 	_thin_join_code = OS.get_environment("FALLOUT_THIN_JOIN_CODE")
+	_trusted_proxies = _address_list(OS.get_environment("FALLOUT_TRUSTED_PROXIES"))
 	var args := OS.get_cmdline_user_args()
 	for i in args.size():
 		var arg: String = args[i]
@@ -42,6 +44,8 @@ func _ready() -> void:
 			_thin_tcp_port = _port_value(arg)
 		elif arg.begins_with("--thin-join-code="):
 			_thin_join_code = arg.trim_prefix("--thin-join-code=")
+		elif arg.begins_with("--trusted-proxies="):
+			_trusted_proxies = _address_list(arg.trim_prefix("--trusted-proxies="))
 		elif arg.begins_with("--heartbeat="):
 			_heartbeat_path = arg.get_slice("=", 1)
 		elif arg == "--map" and i + 1 < args.size():
@@ -54,6 +58,14 @@ func _ready() -> void:
 	# Keep simulating with no window focus and no frame-rate cap from vsync.
 	Engine.max_fps = 60
 	_start.call_deferred()
+
+
+func _address_list(value: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	for part in value.split(",", false):
+		if not part.strip_edges().is_empty():
+			out.append(part.strip_edges())
+	return out
 
 
 func _port_value(arg: String) -> int:
@@ -97,12 +109,20 @@ func _start_thin_server() -> bool:
 		service.free()
 		return false
 	add_child(service)
-	var err: Error = service.listen(_thin_port, _thin_tcp_port, _thin_join_code)
+	var err: Error = service.listen(_thin_port, _thin_tcp_port, _thin_join_code, _trusted_proxies)
 	if err != OK:
 		_log("ERROR could not open Open Protocol listeners (%s)" % error_string(err))
 		return false
 	Net.thin_server = service
 	_log("Open Protocol listeners: WebSocket %d, raw TCP %d (0 disabled)" % [_thin_port, _thin_tcp_port])
+	if _thin_join_code.is_empty():
+		_log("Open Protocol has no join code: any client can join")
+	else:
+		if _thin_join_code.length() < 12:
+			_log("WARNING the Open Protocol join code is shorter than 12 characters; use a long random code")
+		_log("Open Protocol join code set (it does not apply to the native port %d)" % _port)
+	if not _trusted_proxies.is_empty():
+		_log("Open Protocol per-address limits skip trusted proxies: %s" % ", ".join(_trusted_proxies))
 	return true
 
 

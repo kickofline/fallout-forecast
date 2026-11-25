@@ -147,7 +147,7 @@ func host(port := PORT, as_player := true, default_map := Maps.DEFAULT_ID) -> Er
 	mode = Mode.HOST
 	lobby_map_id = Maps.fallback(default_map)
 	lobby_votes_enabled = not as_player
-	var custom := Settings.player_name.strip_edges().left(18)
+	var custom := clean_name(Settings.player_name)
 	local_name = (custom if custom != "" else "HOST") if as_player else "CLOUD SERVER"
 	roster.clear()
 	_allowed_colors.clear()
@@ -382,16 +382,33 @@ func _store_chat(sender: String, text: String) -> void:
 
 ## Plain text only: no control characters, no BBCode, length-capped.
 func _clean_chat(text: String) -> String:
+	return _clean_text(text).left(CHAT_MAX)
+
+
+## Display-safe text shared by chat and callsigns. Drops C0/C1 control
+## characters and bidi overrides: names and chat reach Open Protocol clients
+## through JSON, and Godot's JSON.stringify leaves raw control characters
+## unescaped, which strict parsers reject (see OpenProtocolWire.send_message).
+func _clean_text(text: String) -> String:
 	var out := ""
 	for ch in text.strip_edges():
 		var code := ch.unicode_at(0)
-		if code >= 32 and code != 127:
-			out += ch
-	return out.replace("[", "(").replace("]", ")").left(CHAT_MAX)
+		if code < 32 or (code >= 127 and code <= 159):
+			continue
+		if (code >= 0x202A and code <= 0x202E) or (code >= 0x2066 and code <= 0x2069):
+			continue
+		out += ch
+	return out.replace("[", "(").replace("]", ")")
+
+
+## A callsign as the host stores it: display-safe, trimmed, length-capped.
+## Empty means "no usable name".
+func clean_name(value: Variant, limit := 18) -> String:
+	return _clean_text(value).strip_edges().left(limit) if value is String else ""
 
 
 func set_display_name(new_name: String) -> void:
-	var clean := new_name.strip_edges().left(18)
+	var clean := clean_name(new_name)
 	if clean == "":
 		return
 	local_name = clean
@@ -704,11 +721,11 @@ func _hello(hello: String, protocol := 0) -> void:
 	var data: Variant = JSON.parse_string(hello)
 	if not data is Dictionary:
 		return
-	var player_name: Variant = data.get("name")
+	var player_name := clean_name(data.get("name"), 32)
 	var color: Variant = data.get("color")
 	var skin: Variant = data.get("skin")
 	_allowed_colors[peer_id] = _color_list(data.get("colors"))
-	roster[peer_id] = {"name": player_name.left(32) if player_name is String else "PLAYER", "ready": false}
+	roster[peer_id] = {"name": player_name if player_name != "" else "PLAYER", "ready": false}
 	_assign_cosmetic(peer_id, int(color) if color is float else 0, int(skin) if skin is float else 0)
 	_broadcast_roster()
 	roster_changed.emit()
@@ -792,7 +809,7 @@ func _request_name(new_name: String) -> void:
 	if not is_host() or run_active:
 		return
 	var peer_id := multiplayer.get_remote_sender_id()
-	var clean := new_name.strip_edges().left(18)
+	var clean := clean_name(new_name)
 	if clean != "" and roster.has(peer_id):
 		roster[peer_id]["name"] = clean
 		_broadcast_roster()

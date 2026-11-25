@@ -9,6 +9,9 @@ extends RefCounted
 ## disallows object decoding by default).
 
 const SAFE_INT_MAX := 9007199254740991
+## Deepest client JSON nesting decoded; anything deeper becomes null. Game RPCs
+## nest a few levels at most, and each level costs two GDScript frames here.
+const MAX_DEPTH := 32
 
 
 static func to_json(val: Variant) -> Variant:
@@ -170,8 +173,8 @@ static func to_json(val: Variant) -> Variant:
 			return null
 
 
-static func from_json(val: Variant, type_hint: int = TYPE_NIL) -> Variant:
-	if val == null:
+static func from_json(val: Variant, type_hint: int = TYPE_NIL, depth := 0) -> Variant:
+	if val == null or depth > MAX_DEPTH:
 		return null
 	if val is bool:
 		return val
@@ -196,17 +199,17 @@ static func from_json(val: Variant, type_hint: int = TYPE_NIL) -> Variant:
 	if val is Dictionary:
 		var d: Dictionary = val
 		if d.has("_t") and d["_t"] is String and d.has("v"):
-			return _decode_tagged(d["_t"], d["v"])
+			return _decode_tagged(d["_t"], d["v"], depth)
 		var out := {}
 		for k: Variant in d.keys():
-			out[str(k)] = from_json(d[k])
+			out[str(k)] = from_json(d[k], TYPE_NIL, depth + 1)
 		return out
 	if val is Array:
-		return _decode_array(val, type_hint)
+		return _decode_array(val, type_hint, depth)
 	return val
 
 
-static func _decode_tagged(tag: String, v: Variant) -> Variant:
+static func _decode_tagged(tag: String, v: Variant, depth := 0) -> Variant:
 	match tag:
 		"i":
 			return int(v) if (v is int or v is float or v is String) else 0
@@ -318,10 +321,10 @@ static func _decode_tagged(tag: String, v: Variant) -> Variant:
 			if v is Array:
 				for pair: Variant in v:
 					if pair is Array and pair.size() == 2:
-						var key: Variant = from_json(pair[0])
+						var key: Variant = from_json(pair[0], TYPE_NIL, depth + 1)
 						if key is float and is_finite(key) and floor(key) == key:
 							key = int(key)
-						out[key] = from_json(pair[1])
+						out[key] = from_json(pair[1], TYPE_NIL, depth + 1)
 			return out
 		"bytes":
 			return Marshalls.base64_to_raw(str(v))
@@ -347,7 +350,7 @@ static func _decode_tagged(tag: String, v: Variant) -> Variant:
 			return null
 
 
-static func _decode_array(arr: Array, type_hint: int) -> Variant:
+static func _decode_array(arr: Array, type_hint: int, depth := 0) -> Variant:
 	match type_hint:
 		TYPE_PACKED_INT32_ARRAY:
 			return _to_packed_int32(arr)
@@ -376,7 +379,7 @@ static func _decode_array(arr: Array, type_hint: int) -> Variant:
 		_:
 			var out := []
 			for item: Variant in arr:
-				out.append(from_json(item))
+				out.append(from_json(item, TYPE_NIL, depth + 1))
 			return out
 
 
