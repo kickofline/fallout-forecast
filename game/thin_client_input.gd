@@ -45,18 +45,18 @@ func clear() -> void:
 	_wheel = 0
 
 
-func enqueue(frame: Dictionary) -> void:
+func enqueue(frame: Dictionary) -> bool:
 	var seq := integer(frame.get("seq"), 0, 9007199254740991, -1)
 	if seq <= _last_seq:
-		return
+		return false
 	var mv: Variant = frame.get("mv")
 	if not mv is Array or mv.size() != 2 or not number(mv[0]) or not number(mv[1]):
-		return
+		return false
 	if not number(frame.get("yaw")) or not number(frame.get("pitch")):
-		return
+		return false
 	var aim := Vector2(wrapf(frame.yaw, -PI, PI), clampf(frame.pitch, -PI, PI))
 	if not aim.is_finite():
-		return
+		return false
 	_last_seq = seq
 	_last_ms = Time.get_ticks_msec()
 	if _queue.size() == QUEUE_LIMIT:
@@ -66,6 +66,7 @@ func enqueue(frame: Dictionary) -> void:
 		"buttons": integer(frame.get("b"), 0, 8191, 0),
 		"slot": integer(frame.get("slot"), 0, 5, 0),
 		"wheel": integer(frame.get("wheel"), -1, 1, 0)})
+	return true
 
 
 func advance() -> void:
