@@ -45,9 +45,9 @@ class Session:
 var _websocket := TCPServer.new()
 var _raw := TCPServer.new()
 var _join_code := ""
-## Addresses exempt from per-address limits, e.g. a TLS proxy in front of the
-## WebSocket port that every client appears to come from.
-var _trusted_proxies := PackedStringArray()
+## Addresses or CIDR subnets exempt from per-address limits, e.g. a TLS proxy
+## (or its Docker bridge subnet) in front of the WebSocket port.
+var _trusted_proxies: Array[Dictionary] = []
 var _failures := {}  # address -> {"count", "first", "until", "strikes"}
 var _global_fails: Array[int] = []
 var _sessions: Array[Session] = []
@@ -62,7 +62,7 @@ func listen(ws_port: int, tcp_port: int, join_code: String,
 		trusted_proxies := PackedStringArray()) -> Error:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_join_code = join_code
-	_trusted_proxies = trusted_proxies
+	_trusted_proxies = parse_trusted_proxies(trusted_proxies)
 	if ws_port > 0:
 		var err := _websocket.listen(ws_port)
 		if err != OK:
@@ -263,7 +263,222 @@ func _code_matches(value: Variant) -> bool:
 
 
 func _per_address(address: String) -> bool:
-	return not address.is_empty() and address not in _trusted_proxies
+	return not address.is_empty() and not is_trusted_proxy(address, _trusted_proxies)
+
+
+## Parse comma-split IP addresses and IPv4/IPv6 CIDR ranges (e.g. "10.0.2.0/24",
+## "127.0.0.1", "fd00::/8"). Invalid entries are logged and ignored.
+static func parse_trusted_proxies(entries: PackedStringArray) -> Array[Dictionary]:
+	var rules: Array[Dictionary] = []
+	for entry in entries:
+		var rule := _parse_trusted_proxy(entry)
+		if rule.is_empty():
+			print("[open-protocol] WARNING ignoring invalid trusted proxy entry: %s" % entry)
+		else:
+			rules.append(rule)
+	return rules
+
+
+static func is_trusted_proxy(address: String, rules: Array[Dictionary]) -> bool:
+	if rules.is_empty() or address.is_empty():
+		return false
+	var addr_bytes := _normalize_ip(_parse_ip_raw(address))
+	if addr_bytes.is_empty():
+		return false
+	for rule: Dictionary in rules:
+		if _match_cidr(addr_bytes, rule):
+			return true
+	return false
+
+
+static func _parse_trusted_proxy(entry: String) -> Dictionary:
+	var trimmed := entry.strip_edges()
+	if trimmed.is_empty():
+		return {}
+	var slash := trimmed.find("/")
+	if slash != -1:
+		if trimmed.find("/", slash + 1) != -1:
+			return {}
+		var ip_part := trimmed.left(slash)
+		var prefix_part := trimmed.substr(slash + 1)
+		if not _is_ascii_digits(prefix_part):
+			return {}
+		var raw := _parse_ip_raw(ip_part)
+		if raw.is_empty():
+			return {}
+		var prefix := prefix_part.to_int()
+		if prefix < 0 or prefix > raw.size() * 8:
+			return {}
+		if raw.size() == 16 and _is_ipv4_mapped(raw) and prefix >= 96:
+			raw = raw.slice(12, 16)
+			prefix -= 96
+		return {"bytes": raw, "prefix": prefix, "raw": trimmed}
+	var exact := _normalize_ip(_parse_ip_raw(trimmed))
+	if exact.is_empty():
+		return {}
+	return {"bytes": exact, "prefix": exact.size() * 8, "raw": trimmed}
+
+
+static func _match_cidr(addr_bytes: PackedByteArray, rule: Dictionary) -> bool:
+	var rule_bytes: PackedByteArray = rule.bytes
+	var prefix: int = int(rule.prefix)
+	var candidate := addr_bytes
+	if candidate.size() != rule_bytes.size():
+		if candidate.size() == 4 and rule_bytes.size() == 16:
+			candidate = _ipv4_to_mapped_v6(candidate)
+		else:
+			return false
+	var full_bytes := prefix >> 3
+	for i in full_bytes:
+		if candidate[i] != rule_bytes[i]:
+			return false
+	var rem := prefix & 7
+	if rem > 0:
+		var mask := (0xFF << (8 - rem)) & 0xFF
+		if (candidate[full_bytes] & mask) != (rule_bytes[full_bytes] & mask):
+			return false
+	return true
+
+
+static func _is_ipv4_mapped(bytes: PackedByteArray) -> bool:
+	if bytes.size() != 16:
+		return false
+	for i in 10:
+		if bytes[i] != 0:
+			return false
+	return bytes[10] == 0xFF and bytes[11] == 0xFF
+
+
+static func _normalize_ip(bytes: PackedByteArray) -> PackedByteArray:
+	return bytes.slice(12, 16) if _is_ipv4_mapped(bytes) else bytes
+
+
+static func _ipv4_to_mapped_v6(v4: PackedByteArray) -> PackedByteArray:
+	var out := PackedByteArray()
+	out.resize(16)
+	out[10] = 0xFF
+	out[11] = 0xFF
+	for i in 4:
+		out[12 + i] = v4[i]
+	return out
+
+
+static func _parse_ip_raw(text: String) -> PackedByteArray:
+	var s := text.strip_edges()
+	if s.begins_with("["):
+		var close := s.find("]")
+		if close == -1:
+			return PackedByteArray()
+		var tail := s.substr(close + 1)
+		if not tail.is_empty() and not tail.begins_with("%"):
+			return PackedByteArray()
+		s = s.substr(1, close - 1)
+	var zone := s.find("%")
+	if zone != -1:
+		s = s.left(zone)
+	if s.is_empty():
+		return PackedByteArray()
+	if s.find(":") == -1:
+		return _parse_ipv4(s)
+	return _parse_ipv6(s)
+
+
+static func _parse_ipv4(text: String) -> PackedByteArray:
+	var parts := text.split(".", true)
+	if parts.size() != 4:
+		return PackedByteArray()
+	var out := PackedByteArray()
+	out.resize(4)
+	for i in 4:
+		if not _is_ascii_digits(parts[i]):
+			return PackedByteArray()
+		var v := parts[i].to_int()
+		if v < 0 or v > 255:
+			return PackedByteArray()
+		out[i] = v
+	return out
+
+
+static func _parse_ipv6(text: String) -> PackedByteArray:
+	var halves := text.split("::", true)
+	if halves.size() > 2:
+		return PackedByteArray()
+	var left := _parse_ipv6_groups(halves[0], halves.size() == 1)
+	if left.size() == 1 and left[0] == -1:
+		return PackedByteArray()
+	var groups := PackedInt32Array(left)
+	if halves.size() == 2:
+		var right := _parse_ipv6_groups(halves[1], true)
+		if right.size() == 1 and right[0] == -1:
+			return PackedByteArray()
+		var missing := 8 - groups.size() - right.size()
+		if missing <= 0:
+			return PackedByteArray()
+		for _i in missing:
+			groups.append(0)
+		groups.append_array(right)
+	elif groups.size() != 8:
+		return PackedByteArray()
+	var out := PackedByteArray()
+	out.resize(16)
+	for i in 8:
+		out[i * 2] = (groups[i] >> 8) & 0xFF
+		out[i * 2 + 1] = groups[i] & 0xFF
+	return out
+
+
+static func _parse_ipv6_groups(part: String, allow_ipv4_tail: bool) -> PackedInt32Array:
+	var groups := PackedInt32Array()
+	if part.is_empty():
+		return groups
+	var tokens := part.split(":", true)
+	for i in tokens.size():
+		var tok := tokens[i]
+		if tok.is_empty():
+			return PackedInt32Array([-1])
+		if tok.find(".") != -1:
+			if not allow_ipv4_tail or i != tokens.size() - 1:
+				return PackedInt32Array([-1])
+			var v4 := _parse_ipv4(tok)
+			if v4.is_empty():
+				return PackedInt32Array([-1])
+			groups.append((v4[0] << 8) | v4[1])
+			groups.append((v4[2] << 8) | v4[3])
+			continue
+		var hex := _parse_hex16(tok)
+		if hex < 0:
+			return PackedInt32Array([-1])
+		groups.append(hex)
+	return groups
+
+
+static func _is_ascii_digits(s: String) -> bool:
+	if s.is_empty() or s.length() > 3:
+		return false
+	for i in s.length():
+		var c := s.unicode_at(i)
+		if c < 48 or c > 57:
+			return false
+	return true
+
+
+static func _parse_hex16(s: String) -> int:
+	if s.is_empty() or s.length() > 4:
+		return -1
+	var val := 0
+	for i in s.length():
+		var c := s.unicode_at(i)
+		var d := -1
+		if c >= 48 and c <= 57:
+			d = c - 48
+		elif c >= 65 and c <= 70:
+			d = c - 55
+		elif c >= 97 and c <= 102:
+			d = c - 87
+		else:
+			return -1
+		val = (val << 4) | d
+	return val
 
 
 func _blocked(address: String) -> bool:

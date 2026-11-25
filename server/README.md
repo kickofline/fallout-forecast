@@ -25,11 +25,12 @@ code applies only to the Open Protocol ports, not to the native port 7777.
 
 Wrong join codes are logged and rate-limited per client address. If every
 WebSocket client reaches the server through a reverse proxy, list the proxy's
-address in `FALLOUT_TRUSTED_PROXIES` (comma-separated, or `--trusted-proxies=`)
-so per-address limits don't treat all players as one client; a server-wide
-limit still applies. Rate-limit connections at the proxy or firewall too:
-Godot's listener keeps a short accept backlog, so a fast reconnect flood is best
-dropped before it reaches the server.
+address or CIDR subnet in `FALLOUT_TRUSTED_PROXIES` (comma-separated IPs or
+IPv4/IPv6 CIDRs, e.g. `10.0.2.0/24`, or `--trusted-proxies=`) so per-address
+limits don't treat all players as one client; a server-wide limit still applies.
+Rate-limit connections at the proxy or firewall too: Godot's listener keeps a
+short accept backlog, so a fast reconnect flood is best dropped before it reaches
+the server.
 
 Use a TLS-terminating reverse proxy for public WebSocket connections. Raw TCP is
 plaintext, including the join code. Publish it only on a network where plaintext is
