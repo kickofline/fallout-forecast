@@ -24,7 +24,7 @@ Chronological log of every change affecting **Fallout Forecast**'s native multip
 
 ---
 
-## 2026-11-25 — Tolerate slow and blocked clients (`t3/open-protocol-slow-clients`)
+## 2026-11-25 — Tolerate slow and blocked clients ([PR #2](https://github.com/kickofline/fallout-forecast/pull/2))
 
 - **Versions:** Open Protocol `v1` · `Net.PROTOCOL` `19`
 - **Tiers affected:** Common, Thin, Full
