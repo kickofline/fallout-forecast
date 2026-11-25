@@ -12,7 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Workflow & Rules
 
 - Commit `.uid` files alongside scripts and resources. `.godot/` is ignored.
-- Bump `Net.PROTOCOL` in `game/net.gd` (currently `18`) whenever an RPC signature, replicated payload, or networked node path changes so mismatched clients are rejected cleanly instead of desyncing.
+- Bump `Net.PROTOCOL` in `game/net.gd` (currently `19`) whenever an RPC signature, replicated payload, or networked node path changes so mismatched clients are rejected cleanly instead of desyncing.
+- **Standing rule — Protocol changelog (`docs/open-protocol/CHANGELOG.md`):** Whenever you change *anything* that affects the network or Open Protocol — `Net.PROTOCOL` or Open Protocol `VERSION`, any `@rpc` signature/node path/transfer mode/payload, any Thin or Full message/binary layout/Variant mapping/error string/limit/timeout, or any game-data ID/level marker used by external clients — you **MUST** add a newest-first entry at the top of `docs/open-protocol/CHANGELOG.md` in the same commit/PR following its template (including exact wire/RPC deltas and concrete **Client action** steps for Thin and Full clients). In the same change, update affected `docs/open-protocol/spec-*.md` / `KNOWN_ISSUES.md`, regenerate `docs/open-protocol/open-protocol-schema.json` (`tools/open_protocol/gen_schema.gd`), `rpc-catalog.md` (`tools/open_protocol/gen_rpc_catalog.py`), and `game-data.json` / `level-markers.json` (`tools/open_protocol/gen_reference.gd`) when RPCs or catalogs change, and mirror `docs/open-protocol/` to `kickofline/fallout-forecast-clients` when syncing client docs.
 - Commit and push changes cleanly; keep throwaway test/capture scripts outside the repository.
 - Keep READMEs, compose files, docs, and code comments infrastructure-agnostic (no private hostnames, deployment dashboards, internal UUIDs, or credentials).
 
